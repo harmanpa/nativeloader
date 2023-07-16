@@ -1,6 +1,7 @@
 package tech.cae.nativeloader;
 
 import com.google.common.base.Splitter;
+import com.google.common.collect.Sets;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -22,7 +23,8 @@ public class LibraryLoader {
     private static final Set<LibraryReference> LOADED = new HashSet<>();
     private static File LIBRARYDIR;
 
-    public static void load(ClassLoader classLoader, String pathInJar, String... libraryNames) throws NativeLoaderException {
+    public static void load(ClassLoader classLoader, String pathInJar, String... libraryNames)
+            throws NativeLoaderException {
         for (String libraryName : libraryNames) {
             load(classLoader, pathInJar, makeReference(libraryName));
         }
@@ -35,7 +37,7 @@ public class LibraryLoader {
             List<String> deps = getDeps(classLoader, pathInJar, library);
             if (deps == null) {
                 // If no .deps file exists we fallback on the system
-                loadSystem(library);
+                loadSystem(library, getSearchPaths(classLoader, pathInJar));
             } else {
                 // If a .deps file exists we try to load the dependencies first
                 load(classLoader, pathInJar, deps.toArray(String[]::new));
@@ -45,14 +47,14 @@ public class LibraryLoader {
         }
     }
 
-    static void loadSystem(LibraryReference library) throws NativeLoaderException {
+    static void loadSystem(LibraryReference library, Set<String> searchPaths) throws NativeLoaderException {
         try {
             LOG.info("Loading " + library.getSimpleName() + " via system");
             System.loadLibrary(library.getSimpleName());
         } catch (UnsatisfiedLinkError | SecurityException ex) {
             // If we can find it ourselves we will try that
-            File f = findInSystem(library);
-            if(f != null) {
+            File f = findInSystem(library, searchPaths);
+            if (f != null) {
                 loadAbsolute(f);
                 return;
             }
@@ -60,7 +62,8 @@ public class LibraryLoader {
         }
     }
 
-    static void loadExtracted(ClassLoader classLoader, String pathInJar, LibraryReference library) throws NativeLoaderException {
+    static void loadExtracted(ClassLoader classLoader, String pathInJar, LibraryReference library)
+            throws NativeLoaderException {
         loadAbsolute(extract(classLoader, pathInJar, library));
     }
 
@@ -73,9 +76,11 @@ public class LibraryLoader {
         }
     }
 
-    static File extract(ClassLoader classLoader, String pathInJar, LibraryReference library) throws NativeLoaderException {
-        String resourceLocation = (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/")) + library.getFileName();
-        try ( InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
+    static File extract(ClassLoader classLoader, String pathInJar, LibraryReference library)
+            throws NativeLoaderException {
+        String resourceLocation = (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/"))
+                + library.getFileName();
+        try (InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
             if (resourceAsStream == null) {
                 throw new NativeLoaderException("Could not find embedded native resource " + resourceLocation);
             }
@@ -87,13 +92,30 @@ public class LibraryLoader {
         }
     }
 
-    static List<String> getDeps(ClassLoader classLoader, String pathInJar, LibraryReference library) throws NativeLoaderException {
-        String resourceLocation = (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/")) + library.getFileName() + ".deps";
-        try ( InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
+    static Set<String> getSearchPaths(ClassLoader classLoader, String pathInJar) {
+        String resourceLocation = (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/"))
+                + "searchpaths";
+        try (InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
             if (resourceAsStream == null) {
                 return null;
             }
-            return Splitter.on('\n').omitEmptyStrings().splitToList(new String(resourceAsStream.readAllBytes(), StandardCharsets.UTF_8));
+            return Sets.newHashSet(Splitter.on('\n').omitEmptyStrings()
+                    .splitToList(new String(resourceAsStream.readAllBytes(), StandardCharsets.UTF_8)));
+        } catch (IOException ex) {
+            return Sets.newHashSet();
+        }
+    }
+
+    static List<String> getDeps(ClassLoader classLoader, String pathInJar, LibraryReference library)
+            throws NativeLoaderException {
+        String resourceLocation = (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/"))
+                + library.getFileName() + ".deps";
+        try (InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
+            if (resourceAsStream == null) {
+                return null;
+            }
+            return Splitter.on('\n').omitEmptyStrings()
+                    .splitToList(new String(resourceAsStream.readAllBytes(), StandardCharsets.UTF_8));
         } catch (IOException ex) {
             throw new NativeLoaderException("", ex);
         }
@@ -101,37 +123,40 @@ public class LibraryLoader {
 
     static File getLibraryDir() throws NativeLoaderException {
         if (LIBRARYDIR == null) {
-            LIBRARYDIR = new File(new File(System.getProperty("user.home")==null
-                ? System.getProperty("java.io.tmpdir")
-                : System.getProperty("user.home")), ".caetech/libraries");
+            LIBRARYDIR = new File(new File(System.getProperty("user.home") == null
+                    ? System.getProperty("java.io.tmpdir")
+                    : System.getProperty("user.home")), ".caetech/libraries");
             LIBRARYDIR.mkdirs();
-            if(!(LIBRARYDIR.exists() && LIBRARYDIR.isDirectory())) {
+            if (!(LIBRARYDIR.exists() && LIBRARYDIR.isDirectory())) {
                 throw new NativeLoaderException("Failed to create libraries directory");
             }
         }
-        if(!Files.isWritable(LIBRARYDIR.toPath())) {
-            throw new NativeLoaderException("Libraries directory is not writable");        
+        if (!Files.isWritable(LIBRARYDIR.toPath())) {
+            throw new NativeLoaderException("Libraries directory is not writable");
         }
         return LIBRARYDIR;
     }
 
-    static File findInSystem(LibraryReference library) {
+    static File findInSystem(LibraryReference library, Set<String> searchPaths) {
         File f = findInSystem(library, System.getProperty("java.library.path"));
-        if(f==null) {
+        if (f == null) {
             f = findInSystem(library, System.getenv("PATH"));
+        }
+        if(f == null) {
+            f = findInSystem(library, searchPaths.toArray(String[]::new));
         }
         return f;
     }
 
     static File findInSystem(LibraryReference library, String path) {
-        return path==null || path.isEmpty() ? null : findInSystem(library, path.split(File.pathSeparator));
+        return path == null || path.isEmpty() ? null : findInSystem(library, path.split(File.pathSeparator));
     }
 
     static File findInSystem(LibraryReference library, String[] path) {
-        for(String subpath : path) {
-            if(!subpath.isEmpty()) {
+        for (String subpath : path) {
+            if (!subpath.isEmpty()) {
                 File f = new File(new File(subpath), library.getFileName());
-                if(f.exists()) {
+                if (f.exists()) {
                     return f;
                 }
             }
@@ -145,7 +170,8 @@ public class LibraryLoader {
     }
 
     static LibraryReference makeReference(String libraryName) {
-        String shortName = libraryName.indexOf('.') > -1 ? libraryName.substring(0, libraryName.indexOf('.')) : libraryName;
+        String shortName = libraryName.indexOf('.') > -1 ? libraryName.substring(0, libraryName.indexOf('.'))
+                : libraryName;
         if (isWindows()) {
             String fileName = libraryName.indexOf('.') > -1 ? libraryName : libraryName + ".dll";
             return new LibraryReference(shortName, fileName);

@@ -23,12 +23,12 @@ import org.zeroturnaround.exec.ProcessExecutor;
  * @author peter
  */
 public class LibraryPackager {
-    
+
     public static void main(String[] args) {
-        for(String arg : args) {
-            try {                
+        for (String arg : args) {
+            try {
                 writeDependencies(new File(arg), Arrays.asList("c", "stdc++", "gcc_s", "m", "pthread", "dl"));
-            } catch(IOException ex) {
+            } catch (IOException ex) {
                 ex.printStackTrace();
             }
         }
@@ -38,7 +38,8 @@ public class LibraryPackager {
 
     public static Set<File> getSharedLibraries(File directory) {
         Set<File> sharedLibraries = new LinkedHashSet<>();
-        for(File sharedLibrary : directory.listFiles((File f) -> f.isFile() && (f.getName().endsWith(".dll") || SO_REGEX.matcher(f.getName()).matches()))) {
+        for (File sharedLibrary : directory.listFiles(
+                (File f) -> f.isFile() && (f.getName().endsWith(".dll") || SO_REGEX.matcher(f.getName()).matches()))) {
             sharedLibraries.add(sharedLibrary);
         }
         return sharedLibraries;
@@ -52,21 +53,27 @@ public class LibraryPackager {
         Set<File> sharedLibraries = getSharedLibraries(directory);
         Map<String, String> absoluteNames = new HashMap<>();
         getAbsoluteNames(sharedLibraries, absoluteNames);
+        Set<String> searchPaths = new LinkedHashSet<>();
         for (File sharedLibrary : sharedLibraries) {
-            String deps = getDependents(sharedLibrary)
-                .filter(name -> !excluded.contains(shortName(name)))
-                .map(name -> absoluteNames.getOrDefault(name, name))
-                .reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b);
-            System.out.println("Dependents of " + sharedLibrary.getAbsolutePath() + ":\n\t" + deps.replaceAll("\n", "\n\t"));
-            Files.writeString(new File(directory, sharedLibrary.getName() + ".deps").toPath(), deps, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            String deps = getDependents(sharedLibrary, searchPaths)
+                    .filter(name -> !excluded.contains(shortName(name)))
+                    .map(name -> absoluteNames.getOrDefault(name, name))
+                    .reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b);
+            System.out.println(
+                    "Dependents of " + sharedLibrary.getAbsolutePath() + ":\n\t" + deps.replaceAll("\n", "\n\t"));
+            Files.writeString(new File(directory, sharedLibrary.getName() + ".deps").toPath(), deps,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         }
+        Files.writeString(new File(directory, "searchpaths").toPath(),
+                searchPaths.stream().reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b),
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
     static String shortName(String name) {
-        if(name.indexOf('.')>-1) {
+        if (name.indexOf('.') > -1) {
             name = name.substring(0, name.indexOf('.'));
         }
-        if(name.startsWith("lib")) {
+        if (name.startsWith("lib")) {
             name = name.substring(3);
         }
         return name;
@@ -75,28 +82,36 @@ public class LibraryPackager {
     static void getAbsoluteNames(Set<File> libraries, Map<String, String> nameMapping) {
         // Sort longest name first so we ensure .so files map to their implementation
         libraries.stream()
-            .sorted((File a, File b) -> -Integer.compare(a.getName().length(), b.getName().length()))
-            .forEach((File f) -> getAbsoluteNames(f.getName(), f.getName(), nameMapping));
+                .sorted((File a, File b) -> -Integer.compare(a.getName().length(), b.getName().length()))
+                .forEach((File f) -> getAbsoluteNames(f.getName(), f.getName(), nameMapping));
     }
 
     static void getAbsoluteNames(String absolute, String library, Map<String, String> nameMapping) {
         nameMapping.putIfAbsent(library, absolute);
         // If we are on Linux, then libXXX.so.1.0 == libXXX.so.1 == libXXX.so
         try {
-            Integer.parseInt(library.substring(library.lastIndexOf('.')+1));
+            Integer.parseInt(library.substring(library.lastIndexOf('.') + 1));
             getAbsoluteNames(absolute, library.substring(0, library.lastIndexOf('.')), nameMapping);
-        } catch(NumberFormatException ex) {
+        } catch (NumberFormatException ex) {
         }
     }
 
-    static Stream<String> parse(String response, Pattern lineRegex) {
+    static Stream<String> parse(String response, Pattern lineRegex, Set<String> searchPaths) {
         return Splitter.on('\n').splitToStream(response)
                 .map(line -> lineRegex.matcher(line))
                 .filter(m -> m.matches())
+                .peek(m -> {
+                    if (m.groupCount() > 1) {
+                        String absolute = m.group(2);
+                        if (absolute != null && !absolute.isEmpty() && absolute.endsWith(m.group(1))) {
+                            searchPaths.add(absolute.substring(0, absolute.length() - m.group(1).length()));
+                        }
+                    }
+                })
                 .map(m -> m.group(1));
     }
 
-    public static Stream<String> getDependents(File dll) throws IOException {
+    public static Stream<String> getDependents(File dll, Set<String> searchPaths) throws IOException {
         boolean isWindows = System.getProperty("os.name")
                 .toLowerCase().startsWith("windows");
         List<String> commands = new ArrayList<>();
@@ -104,16 +119,19 @@ public class LibraryPackager {
             commands.addAll(Arrays.asList("cmd", "/c", "dumpbin", "/DEPENDENTS", dll.getAbsolutePath()));
         } else {
             commands.addAll(Arrays.asList("ldd", dll.getAbsolutePath()));
-            // commands.addAll(Arrays.asList("/bin/sh", "-c", "\"ldd " + dll.getAbsolutePath() + "\""));
+            // commands.addAll(Arrays.asList("/bin/sh", "-c", "\"ldd " +
+            // dll.getAbsolutePath() + "\""));
         }
         try {
             String output = new ProcessExecutor().command(commands)
                     .readOutput(true).execute()
                     .outputUTF8();
             if (isWindows) {
-                return parse(output, Pattern.compile("^\\s*([^\\s\\.\\\\\\/]+\\.dll)\\s*$"));
+                return parse(output, Pattern.compile("^\\s*([^\\s\\.\\\\\\/]+\\.dll)\\s*$"), searchPaths);
             } else {
-                return parse(output, Pattern.compile("^\\s*([^\\s\\\\\\/]+) => (?>[^\\s]+\\s\\(0x[0-9a-f]+\\)|not found)$"));
+                return parse(output,
+                        Pattern.compile("^\\s*([^\\s\\\\\\/]+) => (?>([^\\s]+)\\s\\(0x[0-9a-f]+\\)|not found)$"),
+                        searchPaths);
             }
         } catch (IOException | InterruptedException | TimeoutException | InvalidExitValueException ex) {
             throw new IOException("Failed determining library dependencies", ex);
