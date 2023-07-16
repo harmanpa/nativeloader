@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
+import java.util.stream.Collectors;
 import org.zeroturnaround.exec.InvalidExitValueException;
 import org.zeroturnaround.exec.ProcessExecutor;
 
@@ -53,19 +54,29 @@ public class LibraryPackager {
         Set<File> sharedLibraries = getSharedLibraries(directory);
         Map<String, String> absoluteNames = new HashMap<>();
         getAbsoluteNames(sharedLibraries, absoluteNames);
-        Set<String> searchPaths = new LinkedHashSet<>();
+        Set<String> allSearchPaths = new LinkedHashSet<>();
         for (File sharedLibrary : sharedLibraries) {
-            String deps = getDependents(sharedLibrary, searchPaths)
+            // Find the dependencies of a library
+            Map<String, String> searchPaths = new HashMap<>();
+            List<String> depLibraries = getDependents(sharedLibrary, searchPaths)
                     .filter(name -> !excluded.contains(shortName(name)))
                     .map(name -> absoluteNames.getOrDefault(name, name))
-                    .reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b);
+                    .collect(Collectors.toList());
+            // Check the found search paths to exclude files that exist locally
+            for (Map.Entry<String, String> searchPath : searchPaths.entrySet()) {
+                String absName = absoluteNames.getOrDefault(searchPath.getKey(), searchPath.getKey());
+                if (!new File(directory, absName).exists()) {
+                    allSearchPaths.add(searchPath.getValue());
+                }
+            }
+            String deps = depLibraries.stream().reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b);
             System.out.println(
                     "Dependents of " + sharedLibrary.getAbsolutePath() + ":\n\t" + deps.replaceAll("\n", "\n\t"));
             Files.writeString(new File(directory, sharedLibrary.getName() + ".deps").toPath(), deps,
                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         }
         Files.writeString(new File(directory, "searchpaths").toPath(),
-                searchPaths.stream().reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b),
+                allSearchPaths.stream().reduce("", (String a, String b) -> a.isEmpty() ? b : a + "\n" + b),
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
@@ -96,7 +107,7 @@ public class LibraryPackager {
         }
     }
 
-    static Stream<String> parse(String response, Pattern lineRegex, Set<String> searchPaths) {
+    static Stream<String> parse(String response, Pattern lineRegex, Map<String, String> searchPaths) {
         return Splitter.on('\n').splitToStream(response)
                 .map(line -> lineRegex.matcher(line))
                 .filter(m -> m.matches())
@@ -104,14 +115,14 @@ public class LibraryPackager {
                     if (m.groupCount() > 1) {
                         String absolute = m.group(2);
                         if (absolute != null && !absolute.isEmpty() && absolute.endsWith(m.group(1))) {
-                            searchPaths.add(absolute.substring(0, absolute.length() - m.group(1).length()));
+                            searchPaths.put(m.group(1), absolute.substring(0, absolute.length() - m.group(1).length()));
                         }
                     }
                 })
                 .map(m -> m.group(1));
     }
 
-    public static Stream<String> getDependents(File dll, Set<String> searchPaths) throws IOException {
+    public static Stream<String> getDependents(File dll, Map<String, String> searchPaths) throws IOException {
         boolean isWindows = System.getProperty("os.name")
                 .toLowerCase().startsWith("windows");
         List<String> commands = new ArrayList<>();
