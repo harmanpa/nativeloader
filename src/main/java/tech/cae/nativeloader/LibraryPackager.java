@@ -39,10 +39,8 @@ public class LibraryPackager {
 
     public static Set<File> getSharedLibraries(File directory) {
         Set<File> sharedLibraries = new LinkedHashSet<>();
-        for (File sharedLibrary : directory.listFiles(
-                (File f) -> f.isFile() && (f.getName().endsWith(".dll") || SO_REGEX.matcher(f.getName()).matches()))) {
-            sharedLibraries.add(sharedLibrary);
-        }
+        sharedLibraries.addAll(Arrays.asList(directory.listFiles(
+                (File f) -> f.isFile() && (f.getName().endsWith(".dll") || SO_REGEX.matcher(f.getName()).matches()))));
         return sharedLibraries;
     }
 
@@ -97,11 +95,12 @@ public class LibraryPackager {
                 .forEach((File f) -> getAbsoluteNames(f.getName(), f.getName(), nameMapping));
     }
 
+    @SuppressWarnings("InfiniteRecursion")
     static void getAbsoluteNames(String absolute, String library, Map<String, String> nameMapping) {
         nameMapping.putIfAbsent(library, absolute);
         // If we are on Linux, then libXXX.so.1.0 == libXXX.so.1 == libXXX.so
         try {
-            Integer.parseInt(library.substring(library.lastIndexOf('.') + 1));
+            Integer.valueOf(library.substring(library.lastIndexOf('.') + 1));
             getAbsoluteNames(absolute, library.substring(0, library.lastIndexOf('.')), nameMapping);
         } catch (NumberFormatException ex) {
         }
@@ -127,18 +126,16 @@ public class LibraryPackager {
                 .toLowerCase().startsWith("windows");
         List<String> commands = new ArrayList<>();
         if (isWindows) {
-            commands.addAll(Arrays.asList("cmd", "/c", "dumpbin", "/DEPENDENTS", dll.getAbsolutePath()));
+            commands.addAll(Arrays.asList("cmd", "/c", "objdump", dll.getAbsolutePath()));
         } else {
             commands.addAll(Arrays.asList("ldd", dll.getAbsolutePath()));
-            // commands.addAll(Arrays.asList("/bin/sh", "-c", "\"ldd " +
-            // dll.getAbsolutePath() + "\""));
         }
         try {
             String output = new ProcessExecutor().command(commands)
                     .readOutput(true).execute()
                     .outputUTF8();
             if (isWindows) {
-                return parse(output, Pattern.compile("^\\s*([^\\s\\.\\\\\\/]+\\.dll)\\s*$"), searchPaths);
+                return parse(output, Pattern.compile("^\\s*DLL Name:\\s*([^\\s\\.\\\\\\/]+\\.dll)\\s*$"), searchPaths);
             } else {
                 return parse(output,
                         Pattern.compile("^\\s*([^\\s\\\\\\/]+) => (?>([^\\s]+)\\s\\(0x[0-9a-f]+\\)|not found)$"),
