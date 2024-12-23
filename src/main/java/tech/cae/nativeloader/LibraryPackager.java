@@ -28,7 +28,18 @@ public class LibraryPackager {
     public static void main(String[] args) {
         for (String arg : args) {
             try {
-                writeDependencies(new File(arg), Arrays.asList("c", "stdc++", "gcc_s", "m", "pthread", "dl"));
+                writeDependencies(new File(arg), Arrays.asList(
+                        "c",
+                        "stdc++",
+                        "gcc_s",
+                        "gcc_s_seh",
+                        "m",
+                        "pthread",
+                        "winpthread",
+                        "dl",
+                        "KERNEL32",
+                        "api-ms-win-*"
+                ));
             } catch (IOException ex) {
                 ex.printStackTrace();
             }
@@ -57,7 +68,7 @@ public class LibraryPackager {
             // Find the dependencies of a library
             Map<String, String> searchPaths = new HashMap<>();
             List<String> depLibraries = getDependents(sharedLibrary, searchPaths)
-                    .filter(name -> !excluded.contains(shortName(name)))
+                    .filter(name -> !nameMatches(name, excluded))
                     .map(name -> absoluteNames.getOrDefault(name, name))
                     .collect(Collectors.toList());
             // Check the found search paths to exclude files that exist locally
@@ -78,12 +89,35 @@ public class LibraryPackager {
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
+    static boolean nameMatches(String name, List<String> pattern) {
+        return pattern.stream().anyMatch(p -> nameMatches(name, p));
+    }
+
+    static boolean nameMatches(String name, String pattern) {
+        String shortName = shortName(name);
+        if (pattern.contains("*")) {
+            return Pattern.compile(pattern.replace("*", ".*")).matcher(shortName).matches();
+        } else {
+            return pattern.equals(shortName);
+        }
+    }
+
     static String shortName(String name) {
         if (name.indexOf('.') > -1) {
             name = name.substring(0, name.indexOf('.'));
         }
         if (name.startsWith("lib")) {
             name = name.substring(3);
+        }
+        return removeVersionNumber(name);
+    }
+
+    static String removeVersionNumber(String name) {
+        if (name.indexOf('-') > -1) {
+            String number = name.substring(name.lastIndexOf('-') + 1);
+            if (number.length() > 0 && number.chars().allMatch(c -> Character.isDigit(c))) {
+                return name.substring(0, name.lastIndexOf('-'));
+            }
         }
         return name;
     }
@@ -126,7 +160,7 @@ public class LibraryPackager {
                 .toLowerCase().startsWith("windows");
         List<String> commands = new ArrayList<>();
         if (isWindows) {
-            commands.addAll(Arrays.asList("cmd", "/c", "objdump", dll.getAbsolutePath()));
+            commands.addAll(Arrays.asList("cmd", "/c", "objdump", "-p", dll.getAbsolutePath()));
         } else {
             commands.addAll(Arrays.asList("ldd", dll.getAbsolutePath()));
         }
