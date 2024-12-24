@@ -49,9 +49,12 @@ public class LibraryPackager {
     private static final Pattern SO_REGEX = Pattern.compile("^.*\\.so(\\.[0-9]+)*$");
 
     public static Set<File> getSharedLibraries(File directory) {
+        boolean isWindows = System.getProperty("os.name")
+                .toLowerCase().startsWith("windows");
         Set<File> sharedLibraries = new LinkedHashSet<>();
         sharedLibraries.addAll(Arrays.asList(directory.listFiles(
-                (File f) -> f.isFile() && (f.getName().endsWith(".dll") || SO_REGEX.matcher(f.getName()).matches()))));
+                (File f) -> f.isFile() && ((isWindows && f.getName().endsWith(".dll"))
+                || (!isWindows && SO_REGEX.matcher(f.getName()).matches())))));
         return sharedLibraries;
     }
 
