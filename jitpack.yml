@@ -1,0 +1,5 @@
+# JitPack builds on JDK 8 unless told otherwise, and this project targets 21.
+# Without this the compiler fails on "invalid target release: 21" - or, worse,
+# does not fail at all: see the compiler plugin version pinned in pom.xml.
+jdk:
+  - openjdk21
