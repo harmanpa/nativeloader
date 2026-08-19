@@ -6,8 +6,10 @@
     <version>dev</version>
     <packaging>jar</packaging>
     <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
+        <!-- Kept in step with patchwork, which sets the floor for the whole stack -->
+        <maven.compiler.release>21</maven.compiler.release>
+        <guava.version>33.6.0-jre</guava.version>
+        <jna.version>5.18.1</jna.version>
     </properties>
     <dependencies>
         <dependency>
@@ -18,7 +20,23 @@
         <dependency>
             <groupId>com.google.guava</groupId>
             <artifactId>guava</artifactId>
-            <version>32.1.1-jre</version>
+            <version>${guava.version}</version>
+        </dependency>
+        <!-- Only for the one Kernel32 call in LibraryLoader.makeSearchable, which is
+             what lets Windows resolve a dependency between two extracted libraries
+             without them having to be on PATH. There is no way to make that call from
+             Java alone: the foreign function API is still a preview feature in 21, and
+             a JNI stub of our own would need a native toolchain in this build. -->
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna</artifactId>
+            <version>${jna.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 </project>
