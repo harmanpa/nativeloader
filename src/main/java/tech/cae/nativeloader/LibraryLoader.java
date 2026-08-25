@@ -39,12 +39,45 @@ public class LibraryLoader {
     public static void load(ClassLoader classLoader, String pathInJar, String... libraryNames)
             throws NativeLoaderException {
         for (String libraryName : libraryNames) {
-            load(classLoader, pathInJar, makeReference(libraryName));
+            load(classLoader, pathInJar, makeReference(libraryName), false);
         }
     }
 
-    static void load(ClassLoader classLoader, String pathInJar, LibraryReference library) throws NativeLoaderException {
+    /**
+     * @param isDependency whether this library was reached through another
+     *                     library's {@code .deps} file rather than asked for by
+     *                     name, which is what decides whether an unpackaged
+     *                     library is an error or the operating system's to find
+     */
+    static void load(ClassLoader classLoader, String pathInJar, LibraryReference library, boolean isDependency)
+            throws NativeLoaderException {
         if (LOADED.contains(library)) {
+            return;
+        }
+        if (isDependency && !isPackaged(classLoader, pathInJar, library)) {
+            // A dependency that is not in the jar belongs to the platform, and the
+            // operating system will resolve it when the library that imports it is
+            // loaded. Trying to pre-load it here cannot work on Linux and does not
+            // need to on Windows.
+            //
+            // It cannot work on Linux because there is no way to ask for a versioned
+            // library by name: System.loadLibrary("freetype") looks for
+            // libfreetype.so, the development symlink, which a runtime image does not
+            // carry - only libfreetype.so.6. The findInSystem fallback then looks for
+            // that exact filename along java.library.path and PATH, and neither
+            // contains a library directory on a multiarch distribution, where it
+            // lives in /usr/lib/x86_64-linux-gnu. So the load failed, and took the
+            // whole chain that asked for it down with it, on a machine that had the
+            // library installed all along.
+            //
+            // Leaving it alone is also what makes the result correct rather than
+            // merely working: ld.so resolves it out of the shared library cache,
+            // which is the distribution's own answer to where its libraries are, and
+            // no build machine's paths are baked in. If it is genuinely absent, the
+            // System.load of the library that imports it fails and names it.
+            LOG.fine(() -> library.getFileName() + " is not packaged here, so it is left"
+                    + " for the operating system to resolve");
+            LOADED.add(library);
             return;
         }
         if (!LOADING.add(library)) {
@@ -76,7 +109,9 @@ public class LibraryLoader {
                 loadSystem(library, getSearchPaths(classLoader, pathInJar));
             } else {
                 // If a .deps file exists we try to load the dependencies first
-                load(classLoader, pathInJar, deps.toArray(String[]::new));
+                for (String dep : deps) {
+                    load(classLoader, pathInJar, makeReference(dep), true);
+                }
                 loadExtracted(classLoader, pathInJar, library);
             }
             LOADED.add(library);
@@ -168,10 +203,26 @@ public class LibraryLoader {
         }
     }
 
+    /**
+     * Whether this library is one of the ones packaged in the jar, as opposed to
+     * one the platform is expected to provide.
+     */
+    static boolean isPackaged(ClassLoader classLoader, String pathInJar, LibraryReference library) {
+        try (InputStream resourceAsStream = classLoader
+                .getResourceAsStream(resourceLocation(pathInJar, library.getFileName()))) {
+            return resourceAsStream != null;
+        } catch (IOException ex) {
+            return false;
+        }
+    }
+
+    static String resourceLocation(String pathInJar, String name) {
+        return (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/")) + name;
+    }
+
     static File extract(ClassLoader classLoader, String pathInJar, LibraryReference library)
             throws NativeLoaderException {
-        String resourceLocation = (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/"))
-                + library.getFileName();
+        String resourceLocation = resourceLocation(pathInJar, library.getFileName());
         try (InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
             if (resourceAsStream == null) {
                 throw new NativeLoaderException("Could not find embedded native resource " + resourceLocation);

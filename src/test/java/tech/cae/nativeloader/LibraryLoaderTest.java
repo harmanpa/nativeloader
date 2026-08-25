@@ -10,8 +10,10 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import org.junit.Test;
 
 /**
@@ -78,7 +80,9 @@ public class LibraryLoaderTest {
     @Test(timeout = 10000)
     public void aDependencyCycleTerminates() {
         ClassLoader cl = serving(Map.of(
+                "libraries/libfreetype-6.dll", "",
                 "libraries/libfreetype-6.dll.deps", "libharfbuzz-0.dll",
+                "libraries/libharfbuzz-0.dll", "",
                 "libraries/libharfbuzz-0.dll.deps", "libfreetype-6.dll"));
         try {
             LibraryLoader.load(cl, "libraries", "libfreetype-6.dll");
@@ -90,8 +94,11 @@ public class LibraryLoaderTest {
     @Test(timeout = 10000)
     public void aLongerCycleTerminatesToo() {
         ClassLoader cl = serving(Map.of(
+                "libraries/a.dll", "",
                 "libraries/a.dll.deps", "b.dll",
+                "libraries/b.dll", "",
                 "libraries/b.dll.deps", "c.dll",
+                "libraries/c.dll", "",
                 "libraries/c.dll.deps", "a.dll"));
         try {
             LibraryLoader.load(cl, "libraries", "a.dll");
@@ -107,13 +114,51 @@ public class LibraryLoaderTest {
     @Test(timeout = 10000)
     public void aDiamondIsNotMistakenForACycle() {
         ClassLoader cl = serving(Map.of(
+                "libraries/top.dll", "",
                 "libraries/top.dll.deps", "left.dll\nright.dll",
+                "libraries/left.dll", "",
                 "libraries/left.dll.deps", "shared.dll",
+                "libraries/right.dll", "",
                 "libraries/right.dll.deps", "shared.dll",
+                "libraries/shared.dll", "",
                 "libraries/shared.dll.deps", ""));
         try {
             LibraryLoader.load(cl, "libraries", "top.dll");
         } catch (NativeLoaderException | UnsatisfiedLinkError expected) {
+        }
+    }
+
+    // ---- Platform libraries -------------------------------------------------
+
+    /**
+     * A dependency the jar does not carry belongs to the platform, and has to be
+     * left for the operating system to resolve rather than loaded from here.
+     * <p>
+     * There is no way to ask for it by name on Linux. The {@code .deps} files
+     * record a versioned filename - {@code libfreetype.so.6} - because that is
+     * what {@code ldd} reported, but {@code System.loadLibrary} can only ask for
+     * {@code libfreetype.so}, the development symlink a runtime image does not
+     * carry, and the {@code findInSystem} fallback looks along
+     * {@code java.library.path} and PATH, neither of which holds a library
+     * directory on a multiarch distribution. Every one of those misses used to
+     * abort the chain that asked for it, so an OpenCASCADE build failed to load on
+     * a machine that had freetype installed all along.
+     */
+    @Test(timeout = 10000)
+    public void anUnpackagedDependencyIsLeftToTheOperatingSystem() {
+        ClassLoader cl = serving(Map.of(
+                "libraries/libTKService.so", "",
+                "libraries/libTKService.so.deps", "libfreetype.so.6"));
+        try {
+            LibraryLoader.load(cl, "libraries", "libTKService.so");
+            fail("the packaged library is empty, so opening it should not have succeeded");
+        } catch (NativeLoaderException | UnsatisfiedLinkError ex) {
+            // Reaching the packaged library at all is the point: the walk has to
+            // have passed over the platform one it names rather than stopped on it
+            String message = String.valueOf(ex.getMessage());
+            assertTrue(message, message.contains("libTKService.so"));
+            assertFalse("the platform library must not be what the load failed on",
+                    message.contains("freetype"));
         }
     }
 
