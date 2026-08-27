@@ -5,12 +5,18 @@ import com.google.common.collect.Sets;
 import com.sun.jna.Native;
 import com.sun.jna.WString;
 import com.sun.jna.win32.StdCallLibrary;
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -23,27 +29,56 @@ public class LibraryLoader {
 
     private static final Logger LOG = Logger.getLogger(LibraryLoader.class.getName());
 
+    /**
+     * Held for the whole of a load, dependency walk and extraction included.
+     * <p>
+     * Everything mutable in this class is guarded by it, but the reason for it is
+     * not really the collections: it is that {@link #LOADING} means "this walk has
+     * reached that library", and a walk is a single call chain. Two threads
+     * loading at once - a request thread and a worker thread each asking for the
+     * same geometry kernel is the ordinary case - shared one set of it, so the
+     * second thread found the first thread's entry, took it for a dependency cycle
+     * and returned <em>having extracted but not loaded anything</em>. Its call to
+     * {@code load} then looked successful, and the very next native call died with
+     * an {@link UnsatisfiedLinkError} naming a method that was in the jar all
+     * along. Serialising is enough to make that impossible, and loading a native
+     * library is a once-per-process cost that nothing waits on twice.
+     */
+    private static final Object LOCK = new Object();
+
     private static final Set<LibraryReference> LOADED = new HashSet<>();
 
     /**
      * The libraries whose dependencies are currently being walked, in the order
      * the walk reached them. A library is in here from the moment its
      * dependencies start loading until it has itself been loaded, which is what
-     * lets {@link #load(ClassLoader, String, LibraryReference)} recognise a
-     * dependency that leads back into the chain that asked for it.
+     * lets {@link #load(ClassLoader, String, LibraryReference, boolean)}
+     * recognise a dependency that leads back into the chain that asked for it.
+     * <p>
+     * Only ever the one walk in here at a time - see {@link #LOCK}.
      */
     private static final Set<LibraryReference> LOADING = new LinkedHashSet<>();
 
-    private static File LIBRARYDIR;
+    /**
+     * The directory {@link #makeSearchable} last handed to Windows, so that
+     * loading a run of libraries out of one container does not repeat the call.
+     */
+    private static File SEARCHABLE;
 
     public static void load(ClassLoader classLoader, String pathInJar, String... libraryNames)
             throws NativeLoaderException {
-        for (String libraryName : libraryNames) {
-            load(classLoader, pathInJar, makeReference(libraryName), false);
+        synchronized (LOCK) {
+            for (String libraryName : libraryNames) {
+                load(classLoader, pathInJar, makeReference(libraryName), false);
+            }
         }
     }
 
     /**
+     * Loads one library and, first, everything it depends on. Call it holding
+     * {@link #LOCK}: it reads and writes the state that says what has been loaded
+     * and what this walk has already reached.
+     *
      * @param isDependency whether this library was reached through another
      *                     library's {@code .deps} file rather than asked for by
      *                     name, which is what decides whether an unpackaged
@@ -135,17 +170,20 @@ public class LibraryLoader {
      * library, which the operating system finds for itself.
      */
     private static void extractOnly(ClassLoader classLoader, String pathInJar, LibraryReference library,
-            Set<LibraryReference> extracted) {
+            Set<LibraryReference> extracted) throws NativeLoaderException {
         if (LOADED.contains(library) || !extracted.add(library)) {
             return;
         }
-        try {
-            extract(classLoader, pathInJar, library);
-        } catch (NativeLoaderException ex) {
-            LOG.log(Level.FINE, ex, () -> library.getFileName()
+        if (!isPackaged(classLoader, pathInJar, library)) {
+            LOG.fine(() -> library.getFileName()
                     + " is not packaged here, so it is the operating system's to find");
             return;
         }
+        // Asked for and present, so a failure to put it on disk is a failure -
+        // the library that imports it is about to ask the operating system to
+        // find it there, and will fail with nothing but "can't find dependent
+        // libraries" to say why
+        extract(classLoader, pathInJar, library);
         try {
             List<String> deps = getDeps(classLoader, pathInJar, library);
             if (deps != null) {
@@ -191,7 +229,13 @@ public class LibraryLoader {
 
     static void loadExtracted(ClassLoader classLoader, String pathInJar, LibraryReference library)
             throws NativeLoaderException {
-        loadAbsolute(extract(classLoader, pathInJar, library));
+        File file = extract(classLoader, pathInJar, library);
+        // Before the load rather than once at startup, because there is a
+        // directory per container now and only one of them can be the searchable
+        // one. The library about to be loaded is the one whose imports Windows
+        // may have to resolve, so its own directory is the right answer
+        makeSearchable(file.getParentFile());
+        loadAbsolute(file);
     }
 
     static void loadAbsolute(File file) throws NativeLoaderException {
@@ -220,31 +264,109 @@ public class LibraryLoader {
         return (pathInJar == null ? "" : (pathInJar.endsWith("/") ? pathInJar : pathInJar + "/")) + name;
     }
 
+    /**
+     * Puts one packaged library on disk and says where it went.
+     * <p>
+     * What it will not do is hand back a file whose contents are not the ones in
+     * the jar. That used to be possible, and was the worst kind of failure this
+     * class can produce: the copy is refused whenever another process has the
+     * library mapped, the refusal was taken to mean "the loaded copy is the right
+     * one to keep", and so a jar carrying a newer library quietly linked against
+     * an older one left behind by a previous version. Java sees the new class with
+     * its new native method, the process has the old library without it, and the
+     * error names a method that is present in every artifact you can go and look
+     * at.
+     * <p>
+     * So an identical file is reused untouched - which is both the common case and
+     * the one that must not rewrite a mapped file - and anything else is written
+     * beside it and moved into place atomically. The move replaces the directory
+     * entry rather than the file, so a process that already mapped the old one
+     * keeps reading the old inode instead of having the ground moved under it,
+     * which on Linux is the difference between an upgrade and a SIGBUS in an
+     * unrelated JVM. If even that cannot be done, it is an exception: a wrong
+     * library is not a working one.
+     */
     static File extract(ClassLoader classLoader, String pathInJar, LibraryReference library)
             throws NativeLoaderException {
         String resourceLocation = resourceLocation(pathInJar, library.getFileName());
-        try (InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
-            if (resourceAsStream == null) {
-                throw new NativeLoaderException("Could not find embedded native resource " + resourceLocation);
+        if (!isPackaged(classLoader, pathInJar, library)) {
+            throw new NativeLoaderException("Could not find embedded native resource " + resourceLocation);
+        }
+        File f = new File(getContainerDir(classLoader, resourceLocation), library.getFileName());
+        try {
+            if (isAlreadyExtracted(classLoader, resourceLocation, f)) {
+                LOG.fine(() -> f.getAbsolutePath() + " is already the packaged copy, so it is left as it is");
+                return f;
             }
-            File f = new File(getLibraryDir(), library.getFileName());
-            try {
-                Files.copy(resourceAsStream, f.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            } catch (IOException ex) {
-                if (!f.isFile()) {
-                    throw ex;
-                }
-                // Windows will not let a mapped library be rewritten, so this is a
-                // library already loaded into the process - which happens as soon as
-                // the operating system resolves one itself, out of the directory
-                // makeSearchable put on the search path, rather than being told to by
-                // the walk below. The copy on disk is the one that got loaded, so it
-                // is both unreplaceable and the right one to keep.
-                LOG.fine(() -> f.getAbsolutePath() + " is already in use, so the extracted copy is left as it is");
-            }
+            replace(classLoader, resourceLocation, f);
             return f;
         } catch (IOException ex) {
-            throw new NativeLoaderException("", ex);
+            throw new NativeLoaderException("Could not extract " + resourceLocation
+                    + " to " + f.getAbsolutePath(), ex);
+        }
+    }
+
+    /**
+     * Whether the file already on disk is byte for byte the one in the jar.
+     * <p>
+     * Byte for byte rather than by size or timestamp: the versions of a native
+     * library that differ only in what was added to it are exactly the ones this
+     * has to tell apart, and a copy carries no version to compare.
+     */
+    private static boolean isAlreadyExtracted(ClassLoader classLoader, String resourceLocation, File f)
+            throws IOException {
+        if (!f.isFile()) {
+            return false;
+        }
+        try (InputStream extracted = new BufferedInputStream(Files.newInputStream(f.toPath()));
+                InputStream packaged = classLoader.getResourceAsStream(resourceLocation)) {
+            if (packaged == null) {
+                return false;
+            }
+            byte[] a = new byte[1 << 16];
+            byte[] b = new byte[1 << 16];
+            for (;;) {
+                int read = extracted.readNBytes(a, 0, a.length);
+                if (read != packaged.readNBytes(b, 0, b.length)) {
+                    return false;
+                }
+                if (!Arrays.equals(a, 0, read, b, 0, read)) {
+                    return false;
+                }
+                if (read == 0) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    private static void replace(ClassLoader classLoader, String resourceLocation, File f)
+            throws IOException, NativeLoaderException {
+        Path temporary = Files.createTempFile(f.getParentFile().toPath(), f.getName() + ".", ".extracting");
+        try {
+            try (InputStream resourceAsStream = classLoader.getResourceAsStream(resourceLocation)) {
+                if (resourceAsStream == null) {
+                    throw new NativeLoaderException("Could not find embedded native resource " + resourceLocation);
+                }
+                Files.copy(resourceAsStream, temporary, StandardCopyOption.REPLACE_EXISTING);
+            }
+            try {
+                Files.move(temporary, f.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException ex) {
+                // Windows will not replace a mapped library at all, and this is the
+                // only case where that matters: the file that is in the way holds
+                // something other than what the jar carries. Another process getting
+                // there first is not that - it wrote the same bytes - so look before
+                // giving up
+                if (isAlreadyExtracted(classLoader, resourceLocation, f)) {
+                    return;
+                }
+                throw new IOException(f.getAbsolutePath() + " holds a different build of this library"
+                        + " and cannot be replaced, which usually means another process has it loaded."
+                        + " Stop the processes using it, or delete it, and start again", ex);
+            }
+        } finally {
+            Files.deleteIfExists(temporary);
         }
     }
 
@@ -296,21 +418,104 @@ public class LibraryLoader {
      */
     private static final Splitter LINES = Splitter.on('\n').trimResults().omitEmptyStrings();
 
-    static File getLibraryDir() throws NativeLoaderException {
-        if (LIBRARYDIR == null) {
-            LIBRARYDIR = new File(new File(System.getProperty("user.home") == null
-                    ? System.getProperty("java.io.tmpdir")
-                    : System.getProperty("user.home")), ".caetech/libraries");
-            LIBRARYDIR.mkdirs();
-            if (!(LIBRARYDIR.exists() && LIBRARYDIR.isDirectory())) {
-                throw new NativeLoaderException("Failed to create libraries directory");
+    static final String LIBRARIES_PROPERTY = "tech.cae.nativeloader.libraries";
+
+    /**
+     * Where everything this class extracts goes, overridable with
+     * {@code -Dtech.cae.nativeloader.libraries=...} for a deployment that would
+     * rather keep it somewhere it can see and clear out.
+     */
+    static File getLibraryRoot() throws NativeLoaderException {
+        String configured = System.getProperty(LIBRARIES_PROPERTY);
+        File root = configured != null
+                ? new File(configured)
+                : new File(new File(System.getProperty("user.home") == null
+                        ? System.getProperty("java.io.tmpdir")
+                        : System.getProperty("user.home")), ".caetech/libraries");
+        root.mkdirs();
+        if (!(root.exists() && root.isDirectory())) {
+            throw new NativeLoaderException("Failed to create libraries directory " + root.getAbsolutePath());
+        }
+        return root;
+    }
+
+    /**
+     * The directory the libraries of one container - one jar, in practice - are
+     * extracted into.
+     * <p>
+     * A directory each, where there used to be a single shared one, because a
+     * library's filename does not identify the build of it. Two artifacts that
+     * both bundle the MinGW runtime each carry a {@code libstdc++-6.dll}, and if
+     * they were built against different C runtimes only one of those two files is
+     * the right one for either of them - but they have the same name, so in one
+     * directory whichever was extracted last was the one both of them then loaded.
+     * The same collision is what let an old version of an artifact leave a library
+     * behind for a new version of it to pick up. Keyed on the container, a name
+     * only has to be unique within the jar that chose it, which it is.
+     * <p>
+     * The key keeps the container's filename in it as well as a hash of its whole
+     * URL, so that anyone looking at the directory - or at the path in the log
+     * line that says what was loaded - can see which artifact and which version
+     * they are looking at.
+     */
+    static File getContainerDir(ClassLoader classLoader, String resourceLocation) throws NativeLoaderException {
+        File dir = new File(getLibraryRoot(), containerKey(classLoader, resourceLocation));
+        dir.mkdirs();
+        if (!(dir.exists() && dir.isDirectory())) {
+            throw new NativeLoaderException("Failed to create libraries directory " + dir.getAbsolutePath());
+        }
+        if (!Files.isWritable(dir.toPath())) {
+            throw new NativeLoaderException("Libraries directory " + dir.getAbsolutePath() + " is not writable");
+        }
+        return dir;
+    }
+
+    /**
+     * A directory name for whatever holds a resource: the jar, or the directory
+     * of classes, that the class loader found it in.
+     */
+    static String containerKey(ClassLoader classLoader, String resourceLocation) {
+        URL url = classLoader.getResource(resourceLocation);
+        if (url == null) {
+            // A class loader is entitled to serve a stream without ever admitting
+            // where it came from. Nothing then distinguishes one container from
+            // another, so they share, exactly as everything used to
+            return "shared";
+        }
+        String container = url.toString();
+        int embedded = container.indexOf("!/");
+        container = embedded < 0
+                // Not in an archive: the resource is a file, and what holds it is
+                // the directory tree above it, which is what is left after the
+                // resource's own path is taken off the end
+                ? container.substring(0, Math.max(0, container.length() - resourceLocation.length()))
+                : container.substring(0, embedded);
+        return name(container) + "-" + shortHash(container);
+    }
+
+    /**
+     * The last path segment of a URL, reduced to the characters that mean the
+     * same thing to every filesystem.
+     */
+    private static String name(String container) {
+        String name = container.substring(container.lastIndexOf('/') + 1)
+                .replaceAll("[^A-Za-z0-9._-]", "_");
+        return name.isEmpty() ? "libraries" : name;
+    }
+
+    private static String shortHash(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hash = new StringBuilder();
+            for (int i = 0; i < 4; i++) {
+                hash.append(Character.forDigit((digest[i] >> 4) & 0xf, 16))
+                        .append(Character.forDigit(digest[i] & 0xf, 16));
             }
-            makeSearchable(LIBRARYDIR);
+            return hash.toString();
+        } catch (NoSuchAlgorithmException ex) {
+            // Every Java platform is required to implement SHA-256
+            throw new IllegalStateException(ex);
         }
-        if (!Files.isWritable(LIBRARYDIR.toPath())) {
-            throw new NativeLoaderException("Libraries directory is not writable");
-        }
-        return LIBRARYDIR;
     }
 
     /**
@@ -343,6 +548,10 @@ public class LibraryLoader {
      * <p>
      * Failure is not fatal. Everything that worked before this call existed still
      * works without it; only a cycle needs it.
+     * <p>
+     * It takes one directory and there is now one per container, so this is called
+     * before each load rather than once: the directory that has to be searchable
+     * is the one holding the library whose imports are about to be resolved.
      */
     private static void makeSearchable(File directory) {
         if (!isWindows()) {
@@ -350,6 +559,10 @@ public class LibraryLoader {
             // LD_LIBRARY_PATH, and neither can be changed once the process is running
             return;
         }
+        if (directory == null || directory.equals(SEARCHABLE)) {
+            return;
+        }
+        SEARCHABLE = directory;
         try {
             if (Kernel32.INSTANCE.SetDllDirectoryW(new WString(directory.getAbsolutePath()))) {
                 LOG.fine(() -> "Windows will search " + directory.getAbsolutePath()
